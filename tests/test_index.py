@@ -172,6 +172,54 @@ class TestCacheCorruption:
         build(vault, cache, second)
         assert len(second.calls) == 2
 
+    def test_generation_mismatch_triggers_rebuild(self, vault: Path, tmp_path: Path) -> None:
+        """A crash between the two os.replace calls can pair a stale manifest
+        with new vectors; if chunk totals coincide, row counting alone cannot
+        detect it. The shared generation ID makes the pair check exact."""
+        import json
+
+        cache = tmp_path / "cache"
+        build(vault, cache, FakeClient())
+        manifest_path = next(cache.rglob("manifest.json"))
+        manifest = json.loads(manifest_path.read_text())
+        manifest["generation"] = "stale-generation"
+        manifest_path.write_text(json.dumps(manifest))
+        second = FakeClient()
+        build(vault, cache, second)
+        assert len(second.calls) == 2
+
+
+class TestCachePersistence:
+    def test_save_failure_does_not_fail_the_build(
+        self, vault: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The index is already in memory; failing to persist the cache must
+        degrade to a warning, never break the answer path (raw OSError would
+        also escape the RagError contract and traceback in the CLI)."""
+        import os
+        import stat
+
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        os.chmod(blocked, stat.S_IRUSR | stat.S_IXUSR)  # no write -> mkdir fails
+        try:
+            with caplog.at_level(logging.WARNING):
+                idx = build(vault, blocked / "cache", FakeClient())
+            assert len(idx.metas) == 2  # build succeeded regardless
+            assert any("persist" in r.message.lower() for r in caplog.records)
+        finally:
+            os.chmod(blocked, stat.S_IRWXU)
+
+    def test_cache_dir_is_owner_only(self, vault: Path, tmp_path: Path) -> None:
+        cache = tmp_path / "cache"
+        build(vault, cache, FakeClient())
+        assert (cache.stat().st_mode & 0o077) == 0
+
+    def test_no_tmp_files_left_after_save(self, vault: Path, tmp_path: Path) -> None:
+        cache = tmp_path / "cache"
+        build(vault, cache, FakeClient())
+        assert list(cache.rglob("*.tmp")) == []
+
 
 class TestRetrieve:
     def test_most_similar_chunk_ranks_first(self, vault: Path, tmp_path: Path) -> None:

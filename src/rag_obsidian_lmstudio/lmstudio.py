@@ -121,9 +121,14 @@ class LMStudioClient:
             )
             try:
                 data = sorted(payload["data"], key=lambda d: d["index"])
-                rows.extend(d["embedding"] for d in data)
+                vecs = [d["embedding"] for d in data]
             except (KeyError, TypeError) as e:
                 raise EmbeddingError(f"Malformed embeddings response: {e!r}") from e
+            if len(vecs) != len(batch):
+                raise EmbeddingError(
+                    f"LM Studio returned {len(vecs)} embeddings for {len(batch)} inputs."
+                )
+            rows.extend(vecs)
         return np.asarray(rows, dtype=np.float32)
 
     # -- chat -----------------------------------------------------------------

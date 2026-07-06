@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -34,7 +35,7 @@ from .lmstudio import ModelPair
 logger = logging.getLogger(__name__)
 
 _APP_NAME = "rag-obsidian-lmstudio"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2  # v2: shared generation ID ties vectors.npz to manifest.json
 _MANIFEST = "manifest.json"
 _VECTORS = "vectors.npz"
 
@@ -151,8 +152,15 @@ def _load_cache(
         if manifest["schema"] != _SCHEMA_VERSION or manifest["embed_model"] != embed_model:
             return empty
         files: dict[str, dict[str, Any]] = manifest["files"]
-        with np.load(cache_dir / _VECTORS) as npz:  # allow_pickle=False by default
+        with np.load(cache_dir / _VECTORS, allow_pickle=False) as npz:
             vectors = npz["vectors"]
+            generation = str(npz["generation"])
+        if manifest["generation"] != generation:
+            # A crash between the two os.replace calls in _write_cache paired
+            # a stale manifest with new vectors; row counts alone can't always
+            # detect that, the shared generation ID can.
+            logger.info("Cache generation mismatch; rebuilding index from scratch.")
+            return empty
         offsets: dict[str, int] = {}
         total = 0
         for rel, entry in files.items():
@@ -175,19 +183,49 @@ def _save_cache(
     files: dict[str, dict[str, Any]],
     parts: list[np.ndarray],
 ) -> None:
+    """Best-effort persistence: the index is already in memory, so a failure
+    to write the cache (disk full, permissions) degrades to a warning —
+    it must never fail the build or leak a raw OSError past RagError."""
+    try:
+        _write_cache(cache_dir, embed_model, files, parts)
+    except OSError as e:
+        logger.warning("Could not persist index cache to %s: %s", cache_dir, e)
+
+
+def _write_cache(
+    cache_dir: Path,
+    embed_model: str,
+    files: dict[str, dict[str, Any]],
+    parts: list[np.ndarray],
+) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"schema": _SCHEMA_VERSION, "embed_model": embed_model, "files": files}
+    os.chmod(cache_dir, 0o700)  # manifest holds note contents — owner only
+
+    # One generation ID stamped into both files: on load, a mismatch proves
+    # a crash landed between the two os.replace calls below.
+    generation = uuid.uuid4().hex
+    manifest = {
+        "schema": _SCHEMA_VERSION,
+        "generation": generation,
+        "embed_model": embed_model,
+        "files": files,
+    }
 
     vectors_tmp = cache_dir / (_VECTORS + ".tmp")
-    with open(vectors_tmp, "wb") as fh:
-        np.savez_compressed(
-            fh, vectors=np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32)
-        )
-    os.replace(vectors_tmp, cache_dir / _VECTORS)
-
     manifest_tmp = cache_dir / (_MANIFEST + ".tmp")
-    manifest_tmp.write_text(json.dumps(manifest), encoding="utf-8")
-    os.replace(manifest_tmp, cache_dir / _MANIFEST)
+    try:
+        with open(vectors_tmp, "wb") as fh:
+            np.savez_compressed(
+                fh,
+                vectors=np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32),
+                generation=np.array(generation),
+            )
+        os.replace(vectors_tmp, cache_dir / _VECTORS)
+        manifest_tmp.write_text(json.dumps(manifest), encoding="utf-8")
+        os.replace(manifest_tmp, cache_dir / _MANIFEST)
+    finally:
+        vectors_tmp.unlink(missing_ok=True)
+        manifest_tmp.unlink(missing_ok=True)
 
 
 def _normalize(matrix: np.ndarray) -> np.ndarray:

@@ -135,6 +135,18 @@ class TestEmbeddings:
         with pytest.raises(EmbeddingError):
             make_client(handler).embed_documents(["t1"])
 
+    def test_short_response_raises_embedding_error(self) -> None:
+        """A response with fewer embeddings than inputs must fail typed —
+        not crash later in np.vstack with an opaque shape error."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/models"):
+                return models_response(["chat-model", "the-embedder"])
+            return httpx.Response(200, json={"data": []})
+
+        with pytest.raises(EmbeddingError, match="0 embeddings for 2 inputs"):
+            make_client(handler).embed_documents(["t1", "t2"])
+
     def test_malformed_response_raises_embedding_error(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/models"):
